@@ -73,6 +73,7 @@ func (wb *WriteBatch) RollbackToSafePoint() {
 
 func (wb *WriteBatch) WriteToDB(db *badger.DB) error {
 	if len(wb.entries) > 0 {
+		// 通过db.Update方法将WriteBatch中的所有entry写入到badger.DB中，保证原子性和一致性
 		err := db.Update(func(txn *badger.Txn) error {
 			for _, entry := range wb.entries {
 				var err1 error

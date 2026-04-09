@@ -1,6 +1,7 @@
 package storage
 
 // Modify is a single modification to TinyKV's underlying storage.
+// 这个代码定义了tinykv存储层写入时使用的“修改描述”数据结构：把一次写操作（Put 或 Delete）抽象成统一的 Modify 类型，方便批量提交。
 type Modify struct {
 	Data interface{}
 }
@@ -27,6 +28,7 @@ func (m *Modify) Key() []byte {
 }
 
 func (m *Modify) Value() []byte {
+	//只有Put操作才有Value，Delete没有，所以只处理Put的情况
 	if putData, ok := m.Data.(Put); ok {
 		return putData.Value
 	}

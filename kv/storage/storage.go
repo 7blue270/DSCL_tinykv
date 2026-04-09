@@ -16,6 +16,7 @@ type Storage interface {
 
 type StorageReader interface {
 	// When the key doesn't exist, return nil for the value
+	//engine_util.CFItem：调用engine_util.CFItem的Value方法获取value
 	GetCF(cf string, key []byte) ([]byte, error)
 	IterCF(cf string) engine_util.DBIterator
 	Close()
