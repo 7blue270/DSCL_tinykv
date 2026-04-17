@@ -81,7 +81,7 @@ type MemoryStorage struct {
 	hardState pb.HardState
 	snapshot  pb.Snapshot
 	// ents[i] has raft log position i+snapshot.Metadata.Index
-	ents []pb.Entry
+	ents []pb.Entry //存储所有稳定的日志 entries[0] 的index是snapshot.Metadata.Index
 }
 
 // NewMemoryStorage creates an empty MemoryStorage.
@@ -153,6 +153,7 @@ func (ms *MemoryStorage) lastIndex() uint64 {
 
 // FirstIndex implements the Storage interface.
 func (ms *MemoryStorage) FirstIndex() (uint64, error) {
+	//这个函数主要是进行加锁，防止在获取 firstIndex 的过程中，其他 goroutine 修改了 ms.ents 导致数据不一致
 	ms.Lock()
 	defer ms.Unlock()
 	return ms.firstIndex(), nil
@@ -171,6 +172,7 @@ func (ms *MemoryStorage) Snapshot() (pb.Snapshot, error) {
 
 // ApplySnapshot overwrites the contents of this Storage object with
 // those of the given snapshot.
+// 【应用快照】：当节点落后太多了，leader 会发送快照给它，节点接收到快照后会调用 ApplySnapshot 来更新自己的状态
 func (ms *MemoryStorage) ApplySnapshot(snap pb.Snapshot) error {
 	ms.Lock()
 	defer ms.Unlock()
@@ -215,6 +217,7 @@ func (ms *MemoryStorage) CreateSnapshot(i uint64, cs *pb.ConfState, data []byte)
 // Compact discards all log entries prior to compactIndex.
 // It is the application's responsibility to not attempt to compact an index
 // greater than raftLog.applied.
+// 【日志压缩】
 func (ms *MemoryStorage) Compact(compactIndex uint64) error {
 	ms.Lock()
 	defer ms.Unlock()
@@ -238,6 +241,10 @@ func (ms *MemoryStorage) Compact(compactIndex uint64) error {
 // Append the new entries to storage.
 // TODO (xiangli): ensure the entries are continuous and
 // entries[0].Index > ms.entries[0].Index
+
+// 这里需要进行很多处理
+// 冲突处理：如果新发送来的日志与现有日志在某个位置冲突（Index 相同但 Term 不同），Append 会截断掉旧的冲突部分，以新日志为准
+// 连续性检查：它确保日志是连续追加的，如果中间有“空洞”，系统会直接 Panic
 func (ms *MemoryStorage) Append(entries []pb.Entry) error {
 	if len(entries) == 0 {
 		return nil

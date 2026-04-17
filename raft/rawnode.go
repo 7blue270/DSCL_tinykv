@@ -20,6 +20,8 @@ import (
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
 
+//【raft】：实现raft需要实现，leader选举，日志复制，持久化等功能
+
 // ErrStepLocalMsg is returned when try to step a local raft message
 var ErrStepLocalMsg = errors.New("raft: cannot step raft local message")
 
