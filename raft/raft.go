@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"sort"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 )
@@ -201,16 +202,67 @@ func newRaft(c *Config) *Raft {
 
 // sendAppend sends an append RPC with new entries (if any) and the
 // current commit index to the given peer. Returns true if a message was sent.
+// 【函数功能】：leader节点r发送AppendEntries消息给其他节点to，让他们知道leader已经有了新的日志条目了，并同步日志
 func (r *Raft) sendAppend(to uint64) bool {
 	// Your Code Here (2A).
-
-	return false
+	pr, ok := r.Prs[to]
+	if !ok {
+		return false
+	}
+	//取出待收消息的follower的progress
+	preIndex := pr.Next - 1
+	//获得prevterm
+	prevTerm, err := r.RaftLog.Term(preIndex)
+	if err != nil {
+		return false
+	}
+	//构造这次leader要发送的日志条目列表
+	lastIndex := r.RaftLog.LastIndex() //实际的index，即全局index
+	var ents []*pb.Entry
+	if pr.Next <= lastIndex {
+		//【注意】：entries的下标和progress中的next不一样，前者是滑动窗口，后者是全局索引，所以需要进行转换
+		from := r.RaftLog.toEntryIndex(pr.Next)
+		if from < 0 || from >= len(r.RaftLog.entries) {
+			//边界异常检测
+			return false
+		}
+		for i := from; i < len(r.RaftLog.entries); i++ {
+			//从leader的日志中取出从next开始的所有日志条目，准备发送给follower
+			e := r.RaftLog.entries[i]
+			ents = append(ents, &e)
+		}
+	}
+	//构造AppendEntries消息，发送给to节点
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgAppend,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		LogTerm: prevTerm,
+		Index:   preIndex,
+		Entries: ents,
+		Commit:  r.RaftLog.committed, //leader当前已经提交的日志条目的index，告诉follower可以提交到哪个index了
+	}
+	r.msgs = append(r.msgs, msg)
+	return true
 }
 
 // sendHeartbeat sends a heartbeat RPC to the given peer.
+// 【函数功能】：leader节点发送心跳消息给其他节点，让他们知道这个leader还活着
 func (r *Raft) sendHeartbeat(to uint64) {
 	// Your Code Here (2A).
-
+	_, ok := r.Prs[to]
+	if !ok {
+		return
+	}
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeat,
+		To:      to,
+		From:    r.id,
+		Term:    r.Term,
+		Commit:  r.RaftLog.committed, //leader当前已经提交的日志条目的index，告诉follower可以提交到哪个index了
+	}
+	r.msgs = append(r.msgs, msg)
 }
 
 // tick advances the internal logical clock by a single tick.
@@ -493,33 +545,291 @@ func (r *Raft) Step(m pb.Message) error {
 
 // handleAppendEntries handle AppendEntries RPC request
 // 【说明】：这个函数的功能是处理leader发送过来的AppendEntries消息，但需要注意是否要操作raftlog（不太确定）
+// 【对象】：follower节点
+// 【逻辑】：重置选举时间；日志一致性检查；追加/覆盖日志；推进commit；响应leader
 func (r *Raft) handleAppendEntries(m pb.Message) {
 	// Your Code Here (2A).
+	//收到leader的消息，重置选举时间，并记录下来leader的id
+	r.electionElapsed = 0
+	r.Lead = m.From
+
+	//【日志一致性检查】
+	prevIndex := m.Index
+	prevTerm := m.LogTerm
+	term, err := r.RaftLog.Term(prevIndex) //根据leader发送过来的prevIndex，获取follower中对应index的日志条目的term
+	if err != nil || term != prevTerm {
+		//如果日志不一致，那么就拒绝这条消息
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Reject:  true,
+			Index:   r.RaftLog.LastIndex(), //拒绝的消息中携带当前节点的最后一个日志条目的index
+		})
+		return
+	}
+
+	//【追加/覆盖日志】
+	for _, entry := range m.Entries {
+		ent := *entry
+		localLast := r.RaftLog.LastIndex()
+		//判断follower中是否已经有过该index的日志了
+		if ent.Index <= localLast {
+			localTerm, err := r.RaftLog.Term(ent.Index)
+			if err != nil {
+				//如果follower中没有这个index的日志了，那么就拒绝这条消息
+				r.msgs = append(r.msgs, pb.Message{
+					MsgType: pb.MessageType_MsgAppendResponse,
+					To:      m.From,
+					From:    r.id,
+					Term:    r.Term,
+					Reject:  true,
+					Index:   r.RaftLog.LastIndex(),
+				})
+				return
+			}
+			if localTerm != ent.Term {
+				//这个index的日志的term不一致，说明日志不一致了，那么就需要删除这个index以及之后的日志了
+				//【注意】：截断时一是要注意不能截掉dummy entry,二是要注意边界条件
+				cut := r.RaftLog.toEntryIndex(ent.Index)
+				if cut < 1 {
+					cut = 1
+				}
+				if cut > len(r.RaftLog.entries) {
+					cut = len(r.RaftLog.entries)
+				}
+				r.RaftLog.entries = r.RaftLog.entries[:cut]
+				//追加新的日志条目
+				r.RaftLog.entries = append(r.RaftLog.entries, ent)
+			} else {
+				//该条已经存在且相同
+				continue
+			}
+		} else {
+			//follower中没有这个index的日志了，那么就直接追加新的日志条目了
+			r.RaftLog.entries = append(r.RaftLog.entries, ent)
+		}
+	}
+
+	//【推进commit】
+	newcommit := min(m.Commit, r.RaftLog.LastIndex())
+	if newcommit > r.RaftLog.committed {
+		r.RaftLog.committed = newcommit
+	}
+
+	//【响应leader】
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      m.From,
+		From:    r.id,
+		Term:    r.Term,
+		Reject:  false,
+		Index:   r.RaftLog.LastIndex(), //成功的消息中携带当前节点的最后一个日志条目的index
+	})
 }
 
 // handleHeartbeat handle Heartbeat RPC request
+// 【对象】：follower节点
+// 【逻辑】：重置选举时间；推进commit；响应leader
 func (r *Raft) handleHeartbeat(m pb.Message) {
 	// Your Code Here (2A).
+	//收到leader的消息，重置选举时间，并记录下来leader的id
+	r.electionElapsed = 0
+	r.Lead = m.From
+	//推进commit
+	newcommit := min(m.Commit, r.RaftLog.LastIndex())
+	if newcommit > r.RaftLog.committed {
+		r.RaftLog.committed = newcommit
+	}
+	//响应leader
+	msg := pb.Message{
+		MsgType: pb.MessageType_MsgHeartbeatResponse,
+		To:      m.From,
+		From:    r.id,
+		Term:    r.Term,
+		Commit:  r.RaftLog.committed, //leader当前已经提交的日志条目的index，告诉follower可以提交到哪个index了
+		Reject:  false,
+	}
+	r.msgs = append(r.msgs, msg)
 }
 
-// 【新添加】
+// 【新添加】:处理leader发送过来的RequestVote消息，回复一个RequestVoteResponse消息给leader，告诉leader自己是否投票给他了
 func (r *Raft) handleRequestVote(m pb.Message) {
 	// Your Code Here (2A).
+	//取自己最后的日志信息
+	mylastIndex := r.RaftLog.LastIndex()
+	mylastTerm, err := r.RaftLog.Term(mylastIndex)
+	if err != nil {
+		r.msgs = append(r.msgs, pb.Message{
+			MsgType: pb.MessageType_MsgRequestVoteResponse,
+			To:      m.From,
+			From:    r.id,
+			Term:    r.Term,
+			Reject:  true,
+		})
+		return
+	}
+	//判断是否满足投票条件了
+	//【条件一】：候选者的日志必须至少和投票者一样新，才能获得投票
+	candUpToDate := false
+	if mylastTerm < m.LogTerm {
+		candUpToDate = true
+	} else if mylastTerm == m.LogTerm && mylastIndex <= m.Index {
+		candUpToDate = true
+	}
+	//【条件二】：判断是否还能投票
+	canVote := r.Vote == None || r.Vote == m.From
+	//如果满足投票条件了，那么就投票给这个候选者了
+	if canVote && candUpToDate {
+		r.Vote = m.From
+		r.electionElapsed = 0
+	}
+	r.msgs = append(r.msgs, pb.Message{
+		MsgType: pb.MessageType_MsgRequestVoteResponse,
+		To:      m.From,
+		From:    r.id,
+		Term:    r.Term,
+		Reject:  !(canVote && candUpToDate), //如果满足投票条件了，那么就回复一个同意的消息给候选者了，否则回复一个拒绝的消息
+	})
 }
 
-// 【新添加】
+// 【新添加】：回复给msgrequestvote的消息，candidate节点用于统计选票
 func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 	// Your Code Here (2A).
+	if r.State != StateCandidate {
+		return
+	}
+	//去重
+	if _, ok := r.votes[m.From]; ok {
+		return
+	}
+	r.votes[m.From] = !m.Reject
+	//【统计选票】
+	granted := 0
+	rejected := 0
+	for _, vote := range r.votes {
+		if vote {
+			granted++
+		} else {
+			rejected++
+		}
+	}
+
+	quorum := len(r.Prs)/2 + 1
+	if granted >= quorum {
+		r.becomeLeader()
+		return
+	} else if rejected >= quorum {
+		r.becomeFollower(r.Term, None)
+		return
+	}
 }
 
-// 【新添加】leader
+// 【新添加】leader：这里需要进行判断是否过半，从而决定这条日志是否可以commit了（即修改match和next）
 func (r *Raft) handleAppendResponse(m pb.Message) {
 	// Your Code Here (2A).
+	//==========【leader节点的经典处理】==========
+	if r.State != StateLeader {
+		return
+	}
+	//【注意】：忽略旧的term的消息
+	if m.Term < r.Term {
+		return
+	}
+	//集群可能是动态的，所以需要判断一下这个follower是否还在集群中
+	pr, ok := r.Prs[m.From]
+	if !ok {
+		return
+	}
+
+	//==========【根据msg中的reject来更新这个follower的progress】==========
+	//拒绝：leader需要回溯这个follower的next，tinykv中推荐用msg携带的index来更新这个follower的next
+	if m.Reject {
+		if pr.Next > 1 {
+			pr.Next = minU64(pr.Next-1, m.Index+1)
+		} else {
+			pr.Next = 1
+		}
+		r.sendAppend(m.From)
+		return
+	}
+	//接受：leader更新这个follower的match和next并且判断是否可以commit了，如果commit了，还需要广播通知
+	if pr.Match < m.Index {
+		pr.Match = m.Index
+	}
+	pr.Next = m.Index + 1
+
+	//尝试推进commit（多数派 match >=N 且 entry(N).term == currentTerm）
+	if r.maybeCommit() {
+		for id := range r.Prs {
+			if id != r.id {
+				r.sendAppend(id)
+			}
+		}
+	}
+	//如果follower仍然落后，则继续发送后面的entries
+	//【注意】：这里的设计，核心在于{追赶}和{流水线}，处理大批量的日志落后以及新客户端请求的高并发涌入
+	if pr.Next <= r.RaftLog.LastIndex() {
+		r.sendAppend(m.From)
+	}
+}
+
+// 【逻辑】：leader需要在这组进度中找到一个最大的索引N，使得满足matchindex>=N的节点数量超过半数
+func (r *Raft) maybeCommit() bool {
+	// 1. 收集所有节点的 Match 进度（缝合了安全逻辑）
+	matchIndexes := make([]uint64, 0, len(r.Prs))
+	for id, pr := range r.Prs {
+		if id == r.id {
+			// 确保 Leader 自己的一票永远是最新的
+			matchIndexes = append(matchIndexes, r.RaftLog.LastIndex())
+		} else {
+			matchIndexes = append(matchIndexes, pr.Match)
+		}
+	}
+
+	// 2. 降序排序
+	sort.Slice(matchIndexes, func(i, j int) bool {
+		return matchIndexes[i] > matchIndexes[j]
+	})
+
+	// 3. 找多数派进度
+	quorum := len(r.Prs) / 2
+	majorityIndex := matchIndexes[quorum]
+
+	// 4. Raft 提交的两大铁律：
+	// - 多数派索引 > 当前 commit
+	// - 多数派索引对应的日志，必须是当前任期 (Term) 产生的 —— 【leader 只能提交自己任期产生的日志条目】
+	term, err := r.RaftLog.Term(majorityIndex)
+	if err == nil && majorityIndex > r.RaftLog.committed && term == r.Term {
+		r.RaftLog.committed = majorityIndex
+		return true
+	}
+
+	return false
 }
 
 // 【新添加】leader
 func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	// Your Code Here (2A).
+	//==========【leader节点的经典处理】==========
+	if r.State != StateLeader {
+		return
+	}
+	//【注意】：忽略旧的term的消息
+	if m.Term < r.Term {
+		return
+	}
+	//集群可能是动态的，所以需要判断一下这个follower是否还在集群中
+	pr, ok := r.Prs[m.From]
+	if !ok {
+		return
+	}
+
+	if pr.Match < r.RaftLog.LastIndex() {
+		//如果这个follower的next还没有追上leader的日志，那么就需要继续发送AppendEntries消息给这个follower了
+		r.sendAppend(m.From)
+	}
 }
 
 //===========================================================================================================
@@ -537,4 +847,13 @@ func (r *Raft) addNode(id uint64) {
 // removeNode remove a node from raft group
 func (r *Raft) removeNode(id uint64) {
 	// Your Code Here (3A).
+}
+
+// ===========================================================================================================
+// 工具函数
+func minU64(a, b uint64) uint64 {
+	if a < b {
+		return a
+	}
+	return b
 }
