@@ -16,6 +16,7 @@ package raft
 
 import (
 	"errors"
+	"math/rand"
 	"sort"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
@@ -155,6 +156,9 @@ type Raft struct {
 	// valid message from current leader when it is a follower.
 	electionElapsed int
 
+	//【随机化选举超时阈值】【2aa遇见的错误】：每轮在 [electionTimeout, 2*electionTimeout) 内
+	randomElectionTimeout int
+
 	// leadTransferee is id of the leader transfer target when its value is not zero.
 	// Follow the procedure defined in section 3.10 of Raft phd thesis.
 	// (https://web.stanford.edu/~ouster/cgi-bin/papers/OngaroPhD.pdf)
@@ -176,6 +180,12 @@ func newRaft(c *Config) *Raft {
 	if err := c.validate(); err != nil {
 		panic(err.Error())
 	}
+	//【2ab遇见的问题3】：初始化的时候没有从存储恢复持久化状态
+	hs, confState, err := c.Storage.InitialState()
+	if err != nil {
+		panic(err)
+	}
+
 	// Your Code Here (2A).
 	Raft := &Raft{
 		id:               c.ID,
@@ -190,13 +200,31 @@ func newRaft(c *Config) *Raft {
 		electionTimeout:  c.ElectionTick,
 		Prs:              make(map[uint64]*Progress),
 	}
-	//使用peers初始化Prs
-	for _, peer := range c.peers {
+	//【2ab遇见的问题3】：初始化的时候没有从存储恢复持久化状态
+	// 使用配置中的 peers 初始化；若未显式给出，则从持久化 ConfState 恢复。
+	peers := c.peers
+	if len(peers) == 0 {
+		peers = confState.Nodes
+	}
+	for _, peer := range peers {
 		Raft.Prs[peer] = &Progress{
 			Match: 0,
 			Next:  1,
 		}
 	}
+	//【2ab遇见的问题3】：初始化的时候没有从存储恢复持久化状态
+	if !IsEmptyHardState(hs) {
+		Raft.Term = hs.Term
+		Raft.Vote = hs.Vote
+		Raft.RaftLog.committed = hs.Commit
+	}
+	if c.Applied > 0 {
+		Raft.RaftLog.applied = c.Applied
+	}
+
+	//【2aa遇见的问题】 初始化随机选举超时
+	Raft.resetRandomElectionTimeout()
+
 	return Raft
 }
 
@@ -280,9 +308,11 @@ func (r *Raft) tick() {
 	}
 	if r.State == StateFollower || r.State == StateCandidate {
 		r.electionElapsed++
-		if r.electionElapsed >= r.electionTimeout {
+		if r.pastElectionTimeout() {
 			r.Step(pb.Message{MsgType: pb.MessageType_MsgHup})
 			r.electionElapsed = 0
+			//【2aa遇见的错误】【注意】：每一轮选举后下一轮阈值也要随机
+			r.resetRandomElectionTimeout()
 		}
 	}
 }
@@ -296,6 +326,8 @@ func (r *Raft) becomeFollower(term uint64, lead uint64) {
 
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
+	//【2aa遇见的错误】：每一轮选举后下一轮阈值也要随机
+	r.resetRandomElectionTimeout()
 	r.leadTransferee = None
 	//清理投票与投票记录
 	r.Vote = None
@@ -316,6 +348,8 @@ func (r *Raft) becomeCandidate() {
 
 	r.electionElapsed = 0
 	r.heartbeatElapsed = 0
+	//【2aa遇见的错误】：每一轮选举后下一轮阈值也要随机
+	r.resetRandomElectionTimeout()
 	r.leadTransferee = None
 	//清理投票记录并且投票给自己
 	r.votes = make(map[uint64]bool)
@@ -360,6 +394,9 @@ func (r *Raft) becomeLeader() {
 	//更新leader自己的进度并且发送AppendEntries消息给其他节点，让他们知道这个leader已经提交了一个新的日志条目了
 	r.Prs[r.id].Match = lastIndex + 1
 	r.Prs[r.id].Next = lastIndex + 2
+	//【2ac遇到的问题】：单节点场景下，noop 可以立即形成多数并提交；此外，如果添加了entries消息就可以试着推进commit指针了
+	r.maybeCommit()
+	
 	for id := range r.Prs {
 		if id != r.id {
 			r.sendAppend(id)
@@ -495,6 +532,17 @@ func (r *Raft) Step(m pb.Message) error {
 				r.sendAppend(id)
 			}
 		}
+		//【2ab遇见的问题1】
+		//这段代码的本质是保证系统在极端拓扑结构（单投票节点）下的健壮性和低延迟：
+		//解决单节点无法提交的Bug： 依靠本地完成追加直接达成 Quorum，触发 Commit。
+		//状态同步优化： 提交后立即二次广播，目的是把刚刚更新的 CommitIndex 趁热打铁同步给集群中的其余非投票节点（或特殊状态节点）
+		if r.maybeCommit() {
+			for id := range r.Prs {
+				if id != r.id {
+					r.sendAppend(id)
+				}
+			}
+		}
 		return nil
 	}
 	//====================【三.特定角色状态消息处理】====================
@@ -537,6 +585,15 @@ func (r *Raft) Step(m pb.Message) error {
 			r.handleAppendResponse(m)
 		case pb.MessageType_MsgHeartbeatResponse:
 			r.handleHeartbeatResponse(m)
+		case pb.MessageType_MsgRequestVote:
+			//【2ab遇到的问题4】虽然不进行投票了，但也要回复一个拒绝的消息给发送者
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType: pb.MessageType_MsgRequestVoteResponse,
+				To:      m.From,
+				From:    r.id,
+				Term:    r.Term,
+				Reject:  true,
+			})
 		}
 	}
 	return nil
@@ -600,6 +657,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 					cut = len(r.RaftLog.entries)
 				}
 				r.RaftLog.entries = r.RaftLog.entries[:cut]
+				//【2ab遇见的问题2】
+				// 被覆盖区间可能包含已标记为 stabled 的条目，需回退 stabled 到冲突点之前
+				if ent.Index > 0 {
+					r.RaftLog.stabled = minU64(r.RaftLog.stabled, ent.Index-1)
+				}
 				//追加新的日志条目
 				r.RaftLog.entries = append(r.RaftLog.entries, ent)
 			} else {
@@ -612,8 +674,11 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 		}
 	}
 
-	//【推进commit】
-	newcommit := min(m.Commit, r.RaftLog.LastIndex())
+	//【2ab遇见的问题2】
+	//follower推进commit的公式应该按着论文的规则进行，即min(leaderCommit, lastNewEntryIndex)
+	//其意思是，只推进到这次通信，确切核对过、能百分百信任的最高日志索引位置处，不盲目信任follower后面的日志都是正确的
+	lastNewIndex := m.Index + uint64(len(m.Entries))
+	newcommit := min(m.Commit, lastNewIndex)
 	if newcommit > r.RaftLog.committed {
 		r.RaftLog.committed = newcommit
 	}
@@ -637,8 +702,10 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 	//收到leader的消息，重置选举时间，并记录下来leader的id
 	r.electionElapsed = 0
 	r.Lead = m.From
-	//推进commit
-	newcommit := min(m.Commit, r.RaftLog.LastIndex())
+	//【2ab遇见的问题5】
+	// 同理，再收到heartbeat时推进commit，也需要遵守论文中的规则，即min(leaderCommit, lastNewEntryIndex)，不能盲目信任leader的commit
+	lastNewIndex := m.Index + uint64(len(m.Entries))
+	newcommit := min(m.Commit, lastNewIndex)
 	if newcommit > r.RaftLog.committed {
 		r.RaftLog.committed = newcommit
 	}
@@ -856,4 +923,13 @@ func minU64(a, b uint64) uint64 {
 		return a
 	}
 	return b
+}
+
+func (r *Raft) resetRandomElectionTimeout() {
+	// [et, 2et)
+	r.randomElectionTimeout = r.electionTimeout + rand.Intn(r.electionTimeout)
+}
+
+func (r *Raft) pastElectionTimeout() bool {
+	return r.electionElapsed >= r.randomElectionTimeout
 }

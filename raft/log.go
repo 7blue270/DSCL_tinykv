@@ -135,7 +135,7 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
 			return l.entries[unstableIndex:]
 		}
 	}
-	return nil
+	return []pb.Entry{}
 }
 
 // nextEnts returns all the committed but not applied entries
