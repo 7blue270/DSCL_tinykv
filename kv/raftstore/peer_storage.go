@@ -19,6 +19,7 @@ import (
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
 	"github.com/pingcap-incubator/tinykv/raft"
+	//"github.com/pingcap-incubator/tinykv/scheduler/server/kv"
 	"github.com/pingcap/errors"
 )
 
@@ -51,6 +52,7 @@ type PeerStorage struct {
 }
 
 // NewPeerStorage get the persist raftState from engines and return a peer storage
+// 从badger中获取raftState和applyState，构造一个PeerStorage对象返回
 func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionSched chan<- worker.Task, tag string) (*PeerStorage, error) {
 	log.Debugf("%s creating storage for %s", tag, region.String())
 	raftState, err := meta.InitRaftLocalState(engines.Raft, region)
@@ -75,6 +77,7 @@ func NewPeerStorage(engines *engine_util.Engines, region *metapb.Region, regionS
 	}, nil
 }
 
+// 返回raft的初始状态，包含HardState和ConfState
 func (ps *PeerStorage) InitialState() (eraftpb.HardState, eraftpb.ConfState, error) {
 	raftState := ps.raftState
 	if raft.IsEmptyHardState(*raftState.HardState) {
@@ -86,6 +89,7 @@ func (ps *PeerStorage) InitialState() (eraftpb.HardState, eraftpb.ConfState, err
 	return *raftState.HardState, util.ConfStateFromRegion(ps.region), nil
 }
 
+// 通过peer storage中的engines获取badger中存取的low-high之间的raft log entries
 func (ps *PeerStorage) Entries(low, high uint64) ([]eraftpb.Entry, error) {
 	if err := ps.checkRange(low, high); err != nil || low == high {
 		return nil, err
@@ -151,6 +155,7 @@ func (ps *PeerStorage) FirstIndex() (uint64, error) {
 	return ps.truncatedIndex() + 1, nil
 }
 
+// 请求生成快照
 func (ps *PeerStorage) Snapshot() (eraftpb.Snapshot, error) {
 	var snapshot eraftpb.Snapshot
 	if ps.snapState.StateType == snap.SnapState_Generating {
@@ -230,6 +235,7 @@ func (ps *PeerStorage) AppliedIndex() uint64 {
 	return ps.applyState.AppliedIndex
 }
 
+// 验证快照是否合法，主要验证快照的index和epoch是否合法
 func (ps *PeerStorage) validateSnap(snap *eraftpb.Snapshot) bool {
 	idx := snap.GetMetadata().GetIndex()
 	if idx < ps.truncatedIndex() {
@@ -250,11 +256,13 @@ func (ps *PeerStorage) validateSnap(snap *eraftpb.Snapshot) bool {
 	return true
 }
 
+// 删除过期的元数据
 func (ps *PeerStorage) clearMeta(kvWB, raftWB *engine_util.WriteBatch) error {
 	return ClearMeta(ps.Engines, kvWB, raftWB, ps.region.Id, ps.raftState.LastIndex)
 }
 
 // Delete all data that is not covered by `new_region`.
+// 删除过期的数据范围
 func (ps *PeerStorage) clearExtraData(newRegion *metapb.Region) {
 	oldStartKey, oldEndKey := ps.region.GetStartKey(), ps.region.GetEndKey()
 	newStartKey, newEndKey := newRegion.GetStartKey(), newRegion.GetEndKey()
@@ -306,8 +314,27 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
+
+// 【功能】：将raft日志持久化到badger中，并更新raftState和applyState等元数据，同时删除过期的元数据和数据
+// 日志压缩通过删除已经应用到状态机的旧日志来减少日志的存储量
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// Your Code Here (2B).
+
+	//1.将每一个raft日志持久化到badger中
+	for _, entry := range entries {
+		key := meta.RaftLogKey(ps.region.Id, entry.Index)
+		if err := raftWB.SetMeta(key, &entry); err != nil {
+			return err
+		}
+	}
+	//2.更新raftState中的LastIndex和LastTerm等 raftlocalstate 元数据并持久化到badger中
+	lastEntry := entries[len(entries)-1]
+	ps.raftState.LastIndex = lastEntry.Index
+	ps.raftState.LastTerm = lastEntry.Term
+	//meta库的作用是给所有的key加上region id的前缀，方便后续删除过期数据时根据region id进行范围删除
+	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -328,9 +355,40 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 
 // Save memory states to disk.
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
+
+// 【功能】：将ready中的待持久化的数据持久化到badger中，可能会调用Append和ApplySnapshot等函数来持久化 raft日志，快照和硬状态等数据
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
 	// Your Code Here (2B/2C).
+
+	kvWB := new(engine_util.WriteBatch)
+	raftWB := new(engine_util.WriteBatch)
+
+	//【TODO】处理快照（2C）
+
+	//处理raft日志（2B）
+	if len(ready.Entries) > 0 {
+		if err := ps.Append(ready.Entries, raftWB); err != nil {
+			return nil, err
+		}
+	}
+
+	//处理硬状态（2B）
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+		if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
+			return nil, err
+		}
+	}
+
+	//返回打包好的write batch
+	if err := kvWB.WriteToDB(ps.Engines.Kv); err != nil {
+		return nil, err
+	}
+	if err := raftWB.WriteToDB(ps.Engines.Raft); err != nil {
+		return nil, err
+	}
+
 	return nil, nil
 }
 

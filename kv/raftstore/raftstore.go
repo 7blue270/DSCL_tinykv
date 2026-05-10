@@ -35,6 +35,10 @@ func (r *regionItem) Less(other btree.Item) bool {
 	return bytes.Compare(left, right) < 0
 }
 
+// 【含义】raftstore使用storemeta来维护节点上所有的region和对应的peer
+// RWMutex未来保障多个region同时接受请求的时候，防止同时修改storemeta导致数据不一致
+// regionRanges是一个btree，用于快速定位key所在的region
+// regions，用于region id映射region结构体
 type storeMeta struct {
 	sync.RWMutex
 	/// region start key -> region
@@ -104,8 +108,10 @@ type Transport interface {
 	Send(msg *rspb.RaftMessage) error
 }
 
-/// loadPeers loads peers in this store. It scans the db engine, loads all regions and their peers from it
-/// WARN: This store should not be used before initialized.
+// / loadPeers loads peers in this store. It scans the db engine, loads all regions and their peers from it
+// / WARN: This store should not be used before initialized.
+// 节点重启时，需要从硬盘中恢复之前的状态
+// 扫描底层引擎，处理tombstore（墓碑），重建peer，返回所有peer实例列表
 func (bs *Raftstore) loadPeers() ([]*peer, error) {
 	// Scan region meta to get saved regions.
 	startKey := meta.RegionMetaMinKey
@@ -210,6 +216,7 @@ type Raftstore struct {
 	wg         *sync.WaitGroup
 }
 
+// 初始化各种worker的channel，组装好globalContext，加载peer，注册到router，最后启动worker
 func (bs *Raftstore) start(
 	meta *metapb.Store,
 	cfg *config.Config,
@@ -261,6 +268,7 @@ func (bs *Raftstore) start(
 	return nil
 }
 
+// 启动worker，发送store启动消息，发送region启动消息，最后启动tickDriver
 func (bs *Raftstore) startWorkers(peers []*peer) {
 	ctx := bs.ctx
 	workers := bs.workers
@@ -284,6 +292,7 @@ func (bs *Raftstore) startWorkers(peers []*peer) {
 	go bs.tickDriver.run()
 }
 
+// 关闭各种channel，等待worker退出，最后关闭tickDriver
 func (bs *Raftstore) shutDown() {
 	close(bs.closeCh)
 	bs.wg.Wait()
@@ -300,6 +309,7 @@ func (bs *Raftstore) shutDown() {
 	workers.wg.Wait()
 }
 
+// 初始化raftstore并创建router和tickDriver
 func CreateRaftstore(cfg *config.Config) (*RaftstoreRouter, *Raftstore) {
 	storeSender, storeState := newStoreState(cfg)
 	router := newRouter(storeSender)

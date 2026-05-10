@@ -5,15 +5,20 @@ import (
 	"time"
 
 	"github.com/Connor1996/badger/y"
+	//"github.com/gogo/protobuf/test/data"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
+	"github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
 	rspb "github.com/pingcap-incubator/tinykv/proto/pkg/raft_serverpb"
 	"github.com/pingcap-incubator/tinykv/scheduler/pkg/btree"
+	//"github.com/pingcap-incubator/tinykv/scheduler/server/kv"
 	"github.com/pingcap/errors"
 )
 
@@ -38,11 +43,177 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
 	}
 }
 
+// 处理raft ready状态，主要包括持久化raft日志和快照等数据，以及更新raft状态等元数据
+// 【注意】：raftgroup本质上就是raft.RawNode
 func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
 	// Your Code Here (2B).
+	//逻辑：先持久化raft日志和快照等数据，然后发送网络消息，apply已经提交的日志，最后advance
+	if !d.RaftGroup.HasReady() {
+		return
+	}
+	//1.先获得ready状态
+	ready := d.RaftGroup.Ready()
+
+	//log.Info("Committed len: %d", len(ready.CommittedEntries))
+
+	//2.将ready中的待持久化的数据持久化到badger中，可能会调用Append和ApplySnapshot等函数来持久化raft日志和快照等数据
+	applySnapResult, err := d.peerStorage.SaveReadyState(&ready)
+	if err != nil {
+		panic(err)
+	}
+	if applySnapResult != nil {
+		// P2B 中一般不需要特别处理这里，除非需要应用 Leader 发来的快照数据
+	}
+
+	//3.先发送网络消息，raft中是“共识优先，业务滞后”
+	if len(ready.Messages) > 0 {
+		d.Send(d.ctx.trans, ready.Messages)
+	}
+
+	//【核心】4.应用已经提交的日志
+	if len(ready.CommittedEntries) > 0 {
+		// 【关键修复】：创建一个全局的 KV WriteBatch
+		// 绝对不能把 WriteBatch 放在 for 循环里面！
+		kvWB := new(engine_util.WriteBatch)
+
+		//按照提交的日志顺序逐条应用
+		for _, entry := range ready.CommittedEntries {
+			//log.Infof("[Apply 出口] Store %d 准备应用日志. Index: %d, Term: %d, EntryType: %v, DataLen: %d",d.storeID(), entry.Index, entry.Term, entry.EntryType, len(entry.Data))
+
+			// 每次应用日志前，先在内存中更新 ApplyState 的进度
+			d.peerStorage.applyState.AppliedIndex = entry.Index
+
+			// 根据 Entry 类型分发
+			if entry.EntryType == eraftpb.EntryType_EntryConfChange {
+				// TODO (Project 3A): 集群节点变更，暂时忽略
+				continue
+			} else if entry.EntryType == eraftpb.EntryType_EntryNormal {
+				// 处理常规的读写请求
+				d.processNormalEntry(&entry, kvWB)
+			}
+		}
+
+		// 【关键修复】：将最新的 ApplyState 和所有的 Put/Delete 操作打包在同一个 WB 里
+		kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+
+		// 一次性、原子地写入到底层 kvDB 中！
+		err = kvWB.WriteToDB(d.peerStorage.Engines.Kv)
+		if err != nil {
+			panic(err)
+		}
+	}
+	// 4. 推进阶段：告诉 Raft 状态机，这批 Ready 已经处理完了
+	d.RaftGroup.Advance(ready)
+}
+
+func (d *peerMsgHandler) processNormalEntry(entry *eraftpb.Entry, kvWB *engine_util.WriteBatch) {
+	// 1. 处理空日志 (新 Leader 刚上任时会 Propose 一条空日志来推进 CommitIndex)
+	if len(entry.Data) == 0 {
+		return
+	}
+
+	// 2. 反序列化
+	msg := &raft_cmdpb.RaftCmdRequest{}
+	err := msg.Unmarshal(entry.Data)
+	if err != nil {
+		panic(err)
+	}
+
+	// 3. 拦截 Admin 请求 (P2C / P3B)
+	if msg.AdminRequest != nil {
+		// TODO (Project 2C): 处理 CompactLog (日志截断)
+		// TODO (Project 3B): 处理 Split (Region 分裂)
+		return
+	}
+
+	// 4. 处理普通的读写请求 (Project 2B 核心)
+	if len(msg.Requests) > 0 {
+		// 预先分配好一个用于存放结果的响应对象
+		resp := &raft_cmdpb.RaftCmdResponse{
+			Header:    &raft_cmdpb.RaftResponseHeader{},
+			Responses: make([]*raft_cmdpb.Response, 0, len(msg.Requests)),
+		}
+
+		// 遍历执行每一个具体的 Request
+		for _, req := range msg.Requests {
+			switch req.CmdType {
+			case raft_cmdpb.CmdType_Put:
+				kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Put,
+					Put:     &raft_cmdpb.PutResponse{},
+				})
+
+			case raft_cmdpb.CmdType_Delete:
+				kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Delete,
+					Delete:  &raft_cmdpb.DeleteResponse{},
+				})
+
+			case raft_cmdpb.CmdType_Get:
+				val, _ := engine_util.GetCF(d.peerStorage.Engines.Kv, req.Get.Cf, req.Get.Key)
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Get,
+					Get:     &raft_cmdpb.GetResponse{Value: val},
+				})
+
+			case raft_cmdpb.CmdType_Snap:
+				// Snap 通常是独占的，不与其他请求混搭，但按框架要求写入
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Snap,
+					Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+				})
+			}
+		}
+
+		// 5. 将这批执行结果返回给客户端
+		d.handleProposal(entry.Index, entry.Term, resp)
+	}
+}
+
+func (d *peerMsgHandler) handleProposal(index uint64, term uint64, resp *raft_cmdpb.RaftCmdResponse) {
+	// 遍历当前的 proposals 列表
+	for len(d.proposals) > 0 {
+		p := d.proposals[0] // 取出队列头部
+
+		//log.Infof("[Callback 匹配] Store %d 当前执行到 Index: %d, 尝试匹配 Proposal Index: %d", d.storeID(), index, p.index)
+
+		// 找到目标！
+		if p.index == index {
+			if p.term != term {
+				// Term 不匹配：说明是上一个 Leader 留下的过时请求，必须报错
+				NotifyStaleReq(term, p.cb)
+			} else {
+				// 【2b遇见的问题2】：如果这是一个 Snap 请求，必须给 callback 挂载底层的只读事务！不然scan的时候指针就是nil
+				if len(resp.Responses) > 0 && resp.Responses[0].CmdType == raft_cmdpb.CmdType_Snap {
+					// 传入 false 表示这是一个只读事务 (Read-Only Transaction)
+					p.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
+				}
+
+				// 完美匹配：给客户端返回正确结果
+				p.cb.Done(resp)
+			}
+			// 弹出头部元素
+			d.proposals = d.proposals[1:]
+			return
+		}
+
+		// 如果头部的 index 小于当前执行的 index
+		// 说明头部的 proposal 被跳过了 (比如旧 Leader 接收请求后没同步就被覆盖了)
+		// 这些请求永远不可能被提交了，必须通知客户端重试
+		if p.index < index {
+			NotifyStaleReq(term, p.cb)
+			d.proposals = d.proposals[1:]
+		} else {
+			// 如果头部的 index 大于当前执行的 index
+			// 说明还没等到我们想要的 proposal，直接 break 等下一轮 Apply
+			break
+		}
+	}
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -63,14 +234,18 @@ func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
 		d.onPrepareSplitRegion(split.RegionEpoch, split.SplitKey, split.Callback)
 	case message.MsgTypeRegionApproximateSize:
 		d.onApproximateRegionSize(msg.Data.(uint64))
+	//清理已经安装完成的快照文件，或者已经被raft日志压缩掉的快照文件
 	case message.MsgTypeGcSnap:
 		gcSnap := msg.Data.(*message.MsgGCSnap)
 		d.onGCSnap(gcSnap.Snaps)
+	//启动peer
 	case message.MsgTypeStart:
 		d.startTicker()
 	}
 }
 
+// 因为分布式环境很复杂，所以在处理所有请求前，必须确认当前节点的状态是正确的
+// 预处理raft命令，主要包括检查store_id、peer_id、term和region_epoch等元数据是否正确，以及检查请求是否被分发到正确的peer上
 func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) error {
 	// Check store_id, make sure that the msg is dispatched to the right place.
 	if err := util.CheckStoreID(req, d.storeID()); err != nil {
@@ -107,6 +282,8 @@ func (d *peerMsgHandler) preProposeRaftCommand(req *raft_cmdpb.RaftCmdRequest) e
 	return err
 }
 
+// 将客户端请求提供给raft共识
+// 【功能】：如果当前节点是leader，并且请求的元数据正确，那么就将请求封装成raft命令，提交给raft共识模块进行处理
 func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *message.Callback) {
 	err := d.preProposeRaftCommand(msg)
 	if err != nil {
@@ -114,6 +291,28 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		return
 	}
 	// Your Code Here (2B).
+	// 1. 将请求封装成raft命令，序列化成字节数组
+	data, err := msg.Marshal()
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+	//【2b遇到的错误1】：先将cb封装到proposal里，再发起propose请求
+
+	//2.记录callback，以便在raft共识模块处理完这个请求后，能够将结果返回给客户端
+	d.proposals = append(d.proposals, &proposal{
+		//分别记录raft日志的index和发起提议时候的term，以及记录下客户端的cb
+		index: d.nextProposalIndex(),
+		term:  d.Term(),
+		cb:    cb,
+	})
+	//3.发起propose请求
+	// 注意：这里的propose函数是非阻塞的，raft共识模块会在后台处理这个请求，并在适当的时候将结果返回给客户端
+	if err := d.RaftGroup.Propose(data); err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+
 }
 
 func (d *peerMsgHandler) onTick() {
@@ -223,9 +422,9 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)
