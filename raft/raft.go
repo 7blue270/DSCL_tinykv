@@ -242,6 +242,22 @@ func (r *Raft) sendAppend(to uint64) bool {
 	//获得prevterm
 	prevTerm, err := r.RaftLog.Term(preIndex)
 	if err != nil {
+		if err == ErrCompacted {
+			// 日志已被压缩，尝试发送快照
+			snapshot, snapErr := r.RaftLog.storage.Snapshot()
+			if snapErr != nil {
+				return false
+			}
+			r.msgs = append(r.msgs, pb.Message{
+				MsgType:  pb.MessageType_MsgSnapshot,
+				To:       to,
+				From:     r.id,
+				Term:     r.Term,
+				Snapshot: &snapshot,
+			})
+			pr.Next = snapshot.Metadata.Index + 1
+			return true
+		}
 		return false
 	}
 	//构造这次leader要发送的日志条目列表
@@ -396,7 +412,7 @@ func (r *Raft) becomeLeader() {
 	r.Prs[r.id].Next = lastIndex + 2
 	//【2ac遇到的问题】：单节点场景下，noop 可以立即形成多数并提交；此外，如果添加了entries消息就可以试着推进commit指针了
 	r.maybeCommit()
-	
+
 	for id := range r.Prs {
 		if id != r.id {
 			r.sendAppend(id)
@@ -904,6 +920,54 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+	meta := m.Snapshot.Metadata
+	snapIndex := meta.Index
+	snapTerm := meta.Term
+
+	resp := pb.Message{
+		MsgType: pb.MessageType_MsgAppendResponse,
+		To:      m.From,
+		From:    r.id,
+		Term:    r.Term,
+	}
+
+	// 防御 1：任期过期
+	if m.Term < r.Term {
+		resp.Reject = true
+		r.msgs = append(r.msgs, resp)
+		return
+	}
+
+	// 防御 2：本地已提交位置不比快照差，无需退化
+	if r.RaftLog.committed >= snapIndex {
+		resp.Reject = true
+		resp.Index = r.RaftLog.committed
+		r.msgs = append(r.msgs, resp)
+		return
+	}
+
+	// 确认切换为 follower
+	r.becomeFollower(m.Term, m.From)
+
+	// 重建 peers 进度表
+	r.Prs = make(map[uint64]*Progress)
+	for _, id := range meta.ConfState.Nodes {
+		r.Prs[id] = &Progress{Next: snapIndex + 1}
+	}
+
+	// 用快照覆盖 RaftLog
+	r.RaftLog.committed = snapIndex
+	r.RaftLog.applied = snapIndex
+	r.RaftLog.stabled = snapIndex
+	r.RaftLog.pendingSnapshot = m.Snapshot
+
+	// 清空内存 entries，只保留一个 dummy entry 占位
+	dummy := pb.Entry{Index: snapIndex, Term: snapTerm}
+	r.RaftLog.entries = []pb.Entry{dummy}
+
+	// 回应 leader：我已获得 snapIndex 及之前所有数据
+	resp.Index = snapIndex
+	r.msgs = append(r.msgs, resp)
 }
 
 // addNode add a new node to raft group

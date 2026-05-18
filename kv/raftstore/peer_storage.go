@@ -339,8 +339,11 @@ func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.Write
 }
 
 // Apply the peer with given snapshot
+// 【2C】快照落地：更新状态，清理旧数据，调度RegionTaskApply任务到region worker
 func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_util.WriteBatch, raftWB *engine_util.WriteBatch) (*ApplySnapResult, error) {
 	log.Infof("%v begin to apply snapshot", ps.Tag)
+
+	//1.反序列化snapshot中的数据
 	snapData := new(rspb.RaftSnapshotData)
 	if err := snapData.Unmarshal(snapshot.Data); err != nil {
 		return nil, err
@@ -350,7 +353,51 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	// and send RegionTaskApply task to region worker through ps.regionSched, also remember call ps.clearMeta
 	// and ps.clearExtraData to delete stale data
 	// Your Code Here (2C).
-	return nil, nil
+
+	//【因为这是应用层，之前的防御性检查已经在raft层做了，所以这里可以直接应用快照了】
+	//2.删除磁盘里的过时数据
+	if ps.isInitialized() {
+		if err := ps.clearMeta(kvWB, raftWB); err != nil {
+			return nil, err
+		}
+		ps.clearExtraData(snapData.Region)
+	}
+
+	// 3. 更新 peer_storage 的内存状态，包括：
+	// (1). RaftLocalState: 已经「持久化」到DB的最后一条日志设置为快照的最后一条日志
+	// (2). RaftApplyState: 「applied」和「truncated」日志设置为快照的最后一条日志
+	// (3). snapState: SnapState_Applying
+	ps.raftState.LastIndex = snapshot.GetMetadata().GetIndex()
+	ps.raftState.LastTerm = snapshot.GetMetadata().GetTerm()
+	ps.applyState.AppliedIndex = snapshot.GetMetadata().GetIndex()
+	ps.applyState.TruncatedState.Index = snapshot.GetMetadata().GetIndex()
+	ps.applyState.TruncatedState.Term = snapshot.GetMetadata().GetTerm()
+	ps.snapState.StateType = snap.SnapState_Applying
+	if err := raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState); err != nil {
+		return nil, err
+	}
+	if err := kvWB.SetMeta(meta.ApplyStateKey(ps.region.Id), ps.applyState); err != nil {
+		return nil, err
+	}
+
+	// 4. 调度 RegionTaskApply 任务到 region worker，通知它应用快照了
+	ch := make(chan bool, 1)
+	ps.regionSched <- &runner.RegionTaskApply{
+		RegionId: ps.region.GetId(),
+		Notifier: ch,
+		SnapMeta: snapshot.GetMetadata(),
+		StartKey: snapData.Region.GetStartKey(),
+		EndKey:   snapData.Region.GetEndKey(),
+	}
+	<-ch
+
+	// 5. 返回 ApplySnapResult，包含快照应用前的 region 和快照应用后的 region
+	result := &ApplySnapResult{
+		PrevRegion: ps.region,
+		Region:     snapData.Region,
+	}
+	meta.WriteRegionState(kvWB, snapData.Region, rspb.PeerState_Normal)
+	return result, nil
 }
 
 // Save memory states to disk.
@@ -363,8 +410,16 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 
 	kvWB := new(engine_util.WriteBatch)
 	raftWB := new(engine_util.WriteBatch)
+	var result *ApplySnapResult
 
-	//【TODO】处理快照（2C）
+	//【2C】处理快照
+	if !raft.IsEmptySnap(&ready.Snapshot) {
+		var err error
+		result, err = ps.ApplySnapshot(&ready.Snapshot, kvWB, raftWB)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	//处理raft日志（2B）
 	if len(ready.Entries) > 0 {
@@ -389,7 +444,7 @@ func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, erro
 		return nil, err
 	}
 
-	return nil, nil
+	return result, nil
 }
 
 func (ps *PeerStorage) ClearData() {

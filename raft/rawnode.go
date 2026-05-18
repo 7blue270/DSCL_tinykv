@@ -196,6 +196,10 @@ func (rn *RawNode) Ready() Ready {
 		//【注意】：这里需要进行深拷贝，防止上层应用修改了ready中的消息，导致raft的状态出现错误； =r.msgs实际是浅拷贝
 		rd.Messages = append([]pb.Message(nil), r.msgs...)
 	}
+	//(2C)是否有新的快照需要持久化
+	if !IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		rd.Snapshot = *r.RaftLog.pendingSnapshot
+	}
 
 	return rd
 }
@@ -227,7 +231,10 @@ func (rn *RawNode) HasReady() bool {
 	if len(r.msgs) > 0 {
 		return true
 	}
-	//【TODO】：(2C)是否有新的快照需要持久化
+	//(2C)是否有新的快照需要持久化
+	if !IsEmptySnap(r.RaftLog.pendingSnapshot) {
+		return true
+	}
 
 	return false
 }
@@ -253,6 +260,14 @@ func (rn *RawNode) Advance(rd Ready) {
 			Commit: rd.HardState.Commit,
 		}
 	}
+
+	//【2C】快照已经被上层持久化了，这里压缩内存中的entries
+	if !IsEmptySnap(&rd.Snapshot) {
+		r.RaftLog.pendingSnapshot = nil
+	}
+
+	//【2C】处理主动的日志压缩和快照压缩
+	r.RaftLog.maybeCompact()
 
 	//推进stabled和applied
 	if len(rd.Entries) > 0 {

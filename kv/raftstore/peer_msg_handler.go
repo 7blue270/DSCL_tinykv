@@ -66,6 +66,24 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 	if applySnapResult != nil {
 		// P2B 中一般不需要特别处理这里，除非需要应用 Leader 发来的快照数据
+		//【2C】快照应用成功后，需要更新region的信息，不然会出现严重的路由错误
+
+		//1.先获取 storeMeta 的锁，准备更新 region 信息
+		meta := d.ctx.storeMeta
+		meta.Lock()
+
+		//2.更新 region 信息
+		meta.regions[applySnapResult.Region.Id] = applySnapResult.Region
+
+		//3.更新b-tree中的region信息
+		meta.regionRanges.Delete(&regionItem{region: applySnapResult.PrevRegion})
+		meta.regionRanges.ReplaceOrInsert(&regionItem{region: applySnapResult.Region})
+
+		//4.释放锁
+		meta.Unlock()
+
+		//更新peerStorage中的region信息
+		d.SetRegion(applySnapResult.Region)
 	}
 
 	//3.先发送网络消息，raft中是“共识优先，业务滞后”
@@ -75,7 +93,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 
 	//【核心】4.应用已经提交的日志
 	if len(ready.CommittedEntries) > 0 {
-		// 【关键修复】：创建一个全局的 KV WriteBatch
+		// 【关键】：创建一个全局的 KV WriteBatch
 		// 绝对不能把 WriteBatch 放在 for 循环里面！
 		kvWB := new(engine_util.WriteBatch)
 
@@ -96,7 +114,7 @@ func (d *peerMsgHandler) HandleRaftReady() {
 			}
 		}
 
-		// 【关键修复】：将最新的 ApplyState 和所有的 Put/Delete 操作打包在同一个 WB 里
+		// 【关键】：将最新的 ApplyState 和所有的 Put/Delete 操作打包在同一个 WB 里
 		kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
 
 		// 一次性、原子地写入到底层 kvDB 中！
@@ -124,8 +142,26 @@ func (d *peerMsgHandler) processNormalEntry(entry *eraftpb.Entry, kvWB *engine_u
 
 	// 3. 拦截 Admin 请求 (P2C / P3B)
 	if msg.AdminRequest != nil {
-		// TODO (Project 2C): 处理 CompactLog (日志截断)
+		switch msg.AdminRequest.CmdType {
+		// (Project 2C): 处理 CompactLog (日志截断)
+		case raft_cmdpb.AdminCmdType_CompactLog:
+			compactLog := msg.AdminRequest.CompactLog
+			//【防御性编程】
+			if compactLog.CompactIndex > d.peerStorage.applyState.TruncatedState.Index {
+				//1.更新raftTruncatedState
+				d.peerStorage.applyState.TruncatedState = &rspb.RaftTruncatedState{
+					Index: compactLog.CompactIndex,
+					Term:  compactLog.CompactTerm,
+				}
+				//2.调度异步日志删除
+				d.ScheduleCompactLog(compactLog.CompactIndex)
+			}
 		// TODO (Project 3B): 处理 Split (Region 分裂)
+		case raft_cmdpb.AdminCmdType_TransferLeader:
+
+		case raft_cmdpb.AdminCmdType_ChangePeer:
+
+		}
 		return
 	}
 
@@ -602,6 +638,7 @@ func (d *peerMsgHandler) findSiblingRegion() (result *metapb.Region) {
 	return
 }
 
+// raft日志压缩的触发条件：当appliedIdx和firstIdx的差值超过一定阈值时，就触发raft日志压缩
 func (d *peerMsgHandler) onRaftGCLogTick() {
 	d.ticker.schedule(PeerTickRaftLogGC)
 	if !d.IsLeader() {

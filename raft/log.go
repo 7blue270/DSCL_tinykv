@@ -107,9 +107,49 @@ func newLog(storage Storage) *RaftLog {
 // We need to compact the log entries in some point of time like
 // storage compact stabled log entries prevent the log entries
 // grow unlimitedly in memory
-// 【2C】在执行完snapshot之后，应该将之前的日志条目进行压缩，并回收内存
+// 【2C】当底层 Storage 发生日志压缩（compact）后，RaftLog 要同步“裁剪内存里的 entries 缓存”，避免读到已被 compact 的旧日志，并节省内存。
 func (l *RaftLog) maybeCompact() {
 	// Your Code Here (2C).
+	//1. 拿到compact之后的第一个日志条目的index，即底层持久化存储的第一个日志条目的index
+	fi, err := l.storage.FirstIndex()
+	if err != nil {
+		panic(err)
+	}
+	//2.没有内存，直接返回
+	if len(l.entries) == 0 {
+		return
+	}
+	//3.当前dummy index
+	dummyIndex := l.entries[0].Index
+	//一版情况下，dummy index应该等于fi-1,如果满足，提前返回
+	if fi <= dummyIndex+1 {
+		return
+	}
+	//4.计算丢弃到哪里
+	cut := l.toEntryIndex(fi - 1)
+	// cut 越界意味着：storage 的 fi 已经超过了我们内存里最后一条日志
+	// 这种情况通常发生在安装 snapshot 后，内存 entries 已经过期
+	if cut >= len(l.entries) {
+		// 重建一个新的 dummy entry
+		term, err := l.storage.Term(fi - 1)
+		if err != nil {
+			panic(err)
+		}
+		l.entries = []pb.Entry{{Index: fi - 1, Term: term}}
+		return
+	}
+	// 5. 裁剪 entries，使 entries[0] 变成新的 dummy（index=fi-1）
+	// 裁剪后 entries[0] = 原来 entries[cut]
+	l.entries = append([]pb.Entry(nil), l.entries[cut:]...)
+
+	// 6.强制确保 entries[0] 的 index 正好是 fi-1（防御性）
+	if l.entries[0].Index != fi-1 {
+		term, err := l.storage.Term(fi - 1)
+		if err != nil {
+			panic(err)
+		}
+		l.entries[0] = pb.Entry{Index: fi - 1, Term: term}
+	}
 }
 
 // allEntries return all the entries not compacted.
