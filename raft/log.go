@@ -205,12 +205,13 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
 // 3.否则，返回storage中最后一条日志条目的index
 func (l *RaftLog) LastIndex() uint64 {
 	// Your Code Here (2A).
+	// 【2c错误修改】应该返回pendingsnapshot和entries最后一项.Index中较新的那个
+	if len(l.entries) > 0 && (l.pendingSnapshot == nil ||
+		l.entries[len(l.entries)-1].Index >= l.pendingSnapshot.Metadata.Index) {
+		return l.entries[len(l.entries)-1].Index
+	}
 	if l.pendingSnapshot != nil {
 		return l.pendingSnapshot.Metadata.Index
-	}
-	//如果内存中有日志，即除了dummy entry之外还有其他日志条目，则返回最后一条日志条目的index
-	if len(l.entries) > 1 {
-		return l.entries[len(l.entries)-1].Index
 	}
 	lastIndex, err := l.storage.LastIndex()
 	if err != nil {
@@ -223,21 +224,40 @@ func (l *RaftLog) LastIndex() uint64 {
 // 基础查询工具，查询特定index的日志条目的term
 func (l *RaftLog) Term(i uint64) (uint64, error) {
 	// Your Code Here (2A).
-	//1.正在处理snapshot
-	if l.pendingSnapshot != nil && i == l.pendingSnapshot.Metadata.Index {
-		return l.pendingSnapshot.Metadata.Term, nil
-	}
-	//2.如果i在内存中，则返回内存中的日志条目的term
-	if len(l.entries) > 0 {
-		entryIndex := l.toEntryIndex(i)
-		if entryIndex > 0 && entryIndex < len(l.entries) {
-			return l.entries[entryIndex].Term, nil
+	// 【2c】正在处理snapshot时
+	if l.pendingSnapshot != nil {
+		snapshotIndex := l.pendingSnapshot.Metadata.Index
+		if i < snapshotIndex {
+			return 0, ErrCompacted
+		}
+		if i == snapshotIndex {
+			return l.pendingSnapshot.Metadata.Term, nil
 		}
 	}
-	//3.否则，从storage中查询
+	// 如果i在内存中，则返回内存中的日志条目的term
+	if len(l.entries) > 0 {
+		firstIndex := l.entries[0].Index
+		lastIndex := l.entries[len(l.entries)-1].Index
+		if i < firstIndex {
+			return 0, ErrCompacted
+		}
+		if i <= lastIndex {
+			return l.entries[i-firstIndex].Term, nil
+		}
+	}
+	// 否则在storage中查询
 	term, err := l.storage.Term(i)
 	if err != nil {
 		return 0, err
 	}
 	return term, nil
+}
+
+// 【2c】用于返回snapshot的index，即使它还没有被应用，也要能取得到
+func (l *RaftLog) snapshot() (pb.Snapshot, error) {
+	if l.pendingSnapshot != nil {
+		return *l.pendingSnapshot, nil
+	}
+
+	return l.storage.Snapshot()
 }

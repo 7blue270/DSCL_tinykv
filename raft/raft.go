@@ -240,11 +240,14 @@ func (r *Raft) sendAppend(to uint64) bool {
 	//取出待收消息的follower的progress
 	preIndex := pr.Next - 1
 	//获得prevterm
+	//【2c】这里要去修改一下term的代码，使得其能够返回errcompacted的报错信息
 	prevTerm, err := r.RaftLog.Term(preIndex)
 	if err != nil {
 		if err == ErrCompacted {
 			// 日志已被压缩，尝试发送快照
-			snapshot, snapErr := r.RaftLog.storage.Snapshot()
+			//【2c错误1】直接从storage中取的snapshot，但它可能还没有被应用，即数值存放在pendingsnapshot中
+			//snapshot, snapErr := r.RaftLog.storage.Snapshot()
+			snapshot, snapErr := r.RaftLog.snapshot()
 			if snapErr != nil {
 				return false
 			}
