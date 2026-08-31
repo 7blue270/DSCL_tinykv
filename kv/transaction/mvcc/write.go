@@ -15,6 +15,7 @@ type Write struct {
 	Kind    WriteKind
 }
 
+// Write 的 StartTs 同 Kind 一并存在 Value 中
 func (wr *Write) ToBytes() []byte {
 	buf := append([]byte{byte(wr.Kind)}, 0, 0, 0, 0, 0, 0, 0, 0)
 	binary.BigEndian.PutUint64(buf[1:], wr.StartTS)

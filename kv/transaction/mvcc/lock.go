@@ -12,6 +12,7 @@ import (
 
 const TsMax uint64 = ^uint64(0)
 
+// Lock 的 Ts 信息同 Ttl、Kind、Primary Key 一并存在 Value 中
 type Lock struct {
 	Primary []byte
 	Ts      uint64
