@@ -233,7 +233,7 @@ func (txn *MvccTxn) MostRecentWrite(key []byte) (*Write, uint64, error) {
 func EncodeKey(key []byte, ts uint64) []byte {
 	encodedKey := codec.EncodeBytes(key)
 	newKey := append(encodedKey, make([]byte, 8)...)
-	binary.BigEndian.PutUint64(newKey[len(encodedKey):], ^ts)
+	binary.BigEndian.PutUint64(newKey[len(encodedKey):], ^ts) //”^ts“：这里把 uint64 时间戳按位取反，再用大端序 binary.BigEndian，整数大小关系就和字节的字典序一致
 	return newKey
 }
 
